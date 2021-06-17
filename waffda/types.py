@@ -1,16 +1,6 @@
 #!/usr/bin/env python
 import idaapi
-
-'''
-tif = idaapi.tinfo_t()
-idaapi.parse_decl(tif, idaapi.cvar.idati, '', idaapi.PT_TYP)
-array_desc = idaapi.array_type_data_t()
-array_desc.base = 0
-array_desc.nelems = ...
-array_desc.elem_type = tif
-array_tif = idaapi.tinfo_t()
-array_tif.create_array(array_desc)
-'''
+import enum
 
 
 def get_pointer_size():
@@ -28,8 +18,24 @@ TYPE_ALIASES = {
 }
 
 
-def tinfo_to_type(tif):
-    raise NotImplementedError()
+class CallingConventions(enum.Enum):
+    invalid = 0
+    unknown = 16
+    voidarg = 32
+    cdecl = 48
+    ellipsis = 64
+    stdcall = 80
+    pascal = 96
+    fastcall = 112
+    thiscall = 128
+    manual = 144
+    spoiled = 160
+
+    # reserve4 = 176
+    # reserve3 = 192
+    # speciale = 208
+    # specialp = 224
+    # mask = 240
 
 
 class Type:
@@ -72,12 +78,16 @@ class Type:
         self._is_function = False
         self._ret_type = None
         self._arg_types = list()
+        self._cc = CallingConventions.invalid
 
         self._is_struct = False
         self._struct_name = ''
         self._fields = list()
 
         if decl is not None:
+            if isinstance(decl, idaapi.tinfo_t):
+                decl = decl.dstr()
+
             if decl in TYPE_ALIASES:
                 decl = TYPE_ALIASES[decl]
 
@@ -100,17 +110,26 @@ class Type:
 
             self._is_ptr = tif.is_ptr()
             self._is_array = tif.is_array()
-            if self._is_ptr:
-                self._contained_type = tinfo_to_type(tif.get_pointer_object())
+            self._is_function = tif.is_funcptr()
+
+            if self._is_ptr and not self._is_function:
+                self._contained_type = Type(tif.get_pointed_object().dstr())
             elif self._is_array:
                 self._element_count = tif.get_array_nelems()
-                self._contained_type = tinfo_to_type(tif.get_array_element())
+                self._contained_type = Type(tif.get_array_element().dstr())
 
-            self._is_function = tif.is_funcptr()
             if self._is_function:
-                self._ret_type = tinfo_to_type(tif.get_rettype())
-                for idx in range(tif.get_nargs):
-                    self._arg_types.append(tinfo_to_type(tif.get_nth_arg(idx)))
+                self._is_ptr = False  # For compatability's sake
+                self._ret_type = Type(tif.get_rettype().dstr())
+                func_type_data = idaapi.func_type_data_t()
+                func_tif = tif.get_pointed_object()
+                func_tif.get_func_details(func_type_data)
+                try:
+                    self._cc = CallingConventions(func_type_data.cc)
+                except ValueError:
+                    self._cc = CallingConventions(func_type_data.cc ^ 3)
+                for idx in range(tif.get_nargs()):
+                    self._arg_types.append(Type(tif.get_nth_arg(idx).dstr()))
 
             if tif.is_struct():
                 self._is_struct = True
@@ -120,8 +139,7 @@ class Type:
 
     def clone(self):
         '''
-        Returns:
-            Type: A new object identical to this one
+        Returns: Type: A new object identical to this one
         '''
         return Type(self.get_tinfo().dstr())
 
@@ -135,7 +153,6 @@ class Type:
             ptr_type_data.obj_type = self._contained_type.get_tinfo()
             tif = idaapi.tinfo_t()
             tif.create_ptr(ptr_type_data)
-            return tif
         elif self.is_array():
             array_type_data = idaapi.array_type_data_t()
             array_type_data.elem_type = self._contained_type.get_tinfo()
@@ -143,15 +160,29 @@ class Type:
             array_type_data.nelems = self._element_count
             tif = idaapi.tinfo_t()
             tif.create_array(array_type_data)
-            return tif
         elif self.is_function():
-            raise NotImplementedError()
+            func_type_data = idaapi.func_type_data_t()
+            func_type_data.rettype = self._ret_type.get_tinfo()
+            func_type_data.cc = self._cc.value
+            for arg in self._arg_types:
+                funcarg = idaapi.funcarg_t()
+                funcarg.type = arg.get_tinfo()
+                func_type_data.push_back(funcarg)
+            func_tif = idaapi.tinfo_t()
+            func_tif.create_func(func_type_data)
+            tif = idaapi.tinfo_t()
+            ptr_type_data = idaapi.ptr_type_data_t()
+            ptr_type_data.obj_type = func_tif
+            tif.create_ptr(ptr_type_data)
         elif self.is_struct():
             raise NotImplementedError()
         else:
             tif = idaapi.tinfo_t()
             idaapi.parse_decl(tif, idaapi.cvar.idati, f'{self._decl};', idaapi.PT_TYP)
             return tif
+
+        # TODO: add const/volatile information
+        return tif
 
     def register(self):
         '''
@@ -327,6 +358,15 @@ class Type:
             raise ValueError('Not a function type')
         return self._ret_type
 
+    def get_calling_convention(self):
+        '''
+        Returns:
+            CallingConventions: CC of function type
+        '''
+        if not self.is_function():
+            raise ValueError('Not a function type')
+        return self._cc
+
     def set_args(self, args):
         '''
         Args:
@@ -344,6 +384,17 @@ class Type:
         if not self.is_function():
             raise ValueError('Not a function type')
         self._ret_type = ret_type
+
+    def set_calling_convention(self, cc):
+        '''
+        Args:
+            cc (CallingConventions|int): New calling convention
+        '''
+        if not self.is_function():
+            raise ValueError('Not a function type')
+        if not isinstance(cc, CallingConventions):
+            cc = CallingConventions(cc)
+        self._cc = cc
 
     def is_struct(self):
         '''
@@ -386,6 +437,9 @@ class Type:
 
     def __str__(self):
         return self.get_tinfo().dstr()
+
+    def __eq__(self, other):
+        return self.get_tinfo() == other.get_tinfo()
 
 
 class Field:
